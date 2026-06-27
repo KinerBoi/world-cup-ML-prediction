@@ -1,0 +1,9 @@
+cat > .gitignore << 'EOF'
+# datasets — keep these local, don't commit
+data/
+
+# Mac + Python clutter
+.DS_Store
+__pycache__/
+*.pyc
+EOF
