@@ -1,117 +1,47 @@
-# World Cup Winner Predictor
+# 2026 FIFA World Cup — Match Prediction & Bracket Simulation
 
-Predicts each team's chance of winning the World Cup by (1) training a model on
-historical matches to estimate **who wins a single game**, then (2) **simulating
-the knockout bracket** thousands of times and counting champions.
+A machine-learning pipeline that predicts international match outcomes and simulates the 2026 World Cup knockout bracket to estimate each team's odds of reaching every round. Built as a learn-by-doing project: every stage was written to understand a concept, not just to produce a number.
 
-It works **right now** on auto-generated fake data, so you can see the whole
-thing run before the real group stage even finishes. You then swap in real data
-at the end.
+## The core idea
 
----
+Predicting a World Cup champion directly is close to hopeless — there have only ever been a couple dozen tournaments, far too few examples for a model to learn from. So the problem is reframed: instead of predicting the rare event (the winner), the model predicts the common one (a single match), trained on roughly 49,000 historical internationals. A Monte Carlo simulation then plays the bracket 10,000 times, letting those match probabilities decide each game, and counts how often each team ends up champion. The rare-event answer emerges from many repetitions of the common-event model.
 
-## Setup (one time)
+## How the pipeline fits together
 
-```bash
-pip install scikit-learn pandas numpy joblib
-```
+The project is a chain of small scripts, each consuming what the previous one produced.
 
-## Run it
+**`make_elo.py`** walks every match in chronological order and maintains an Elo rating for each national team, using an eloratings.net-style scheme: the K-factor scales with the importance of the fixture (friendlies move ratings little, World Cup matches a lot), a goal-margin multiplier rewards decisive wins, and a home-advantage bonus is applied to the host side. Crucially, it records each team's rating *as it stood before* each match, so historical games are never contaminated with future strength.
 
-Run the four scripts in order. Each saves a file that the next one reads.
+**`02_features.py`** turns raw match rows into model-ready numbers, one row per match, written from the home team's perspective. The features are differences rather than raw values — `elo_diff` (home minus away strength), `form_diff` (each team's average points over its recent games, computed so the current match is excluded), and a neutral-venue flag. The target is the result: away win, draw, or home win. FIFA ranking was deliberately dropped, since Elo already captures relative strength.
 
-```bash
-python 01_make_sample_data.py   # invents fake data in ./data/
-python 02_features.py           # turns matches into model inputs
-python 03_train.py              # trains the model + checks it on unseen games
-python 04_simulate.py           # simulates the bracket -> winner probabilities
-```
+**`03_train.py`** fits a logistic regression and evaluates it honestly. The train/test split is chronological — older matches train, recent matches test — mirroring the real task of forecasting games that haven't happened. Performance is measured with log-loss against a baseline that ignores the features entirely, so the comparison rewards calibrated probabilities rather than lucky guesses.
 
-If step 4 prints a sensible-looking table of teams and percentages that add up
-to 1.00, the machine works. Now you make it real.
+**`04_simulate.py`** is the bracket simulator. Because there are only 32 teams, it precomputes every possible pairwise matchup probability once, then reuses that lookup table across 10,000 simulated tournaments. Drawn knockout games are resolved by a penalty shootout weighted toward the stronger side. An optional squad-value prior can be layered on top (see below).
 
----
+**`05_bracket_viz.py`** re-runs the simulation while tracking how far each team advances in every tournament, then renders the round-by-round survival probabilities as a heatmap.
 
-## The big idea (read this once)
+## Methodology choices worth noting
 
-You will only ever get ONE real World Cup to "test" a champion prediction on, so
-you can't train a model to predict the champion directly. Instead:
+- **Leakage prevention is the central discipline.** The single biggest risk in the whole project is letting a feature peek at information that wouldn't have existed at match time. Both Elo and recent form are constructed to use only pre-match data; the chronological split extends the same logic to evaluation.
+- **Probabilities over hard labels.** The simulator needs calibrated three-way probabilities, not a single predicted winner, so the model is scored with log-loss and the baseline is probabilistic too — an apples-to-apples comparison.
+- **Differences, not raw values.** Encoding each match as a difference between the two teams lets the model generalize to pairings it has never seen, which is exactly what the knockout rounds demand.
 
-1. **Match model** — train on thousands of past matches to predict a single
-   game: probabilities of `away win / draw / home win`.
-2. **Simulation** — play the 31-game knockout bracket 10,000 times, letting each
-   game be decided randomly by those probabilities. The share of simulations a
-   team wins *is* its championship probability.
+## The squad-value prior
 
-This is the standard, sane way to do it, and it's why the project is doable by
-Sunday.
+The trained model learns only from results, and on that basis it ranks Argentina as the strongest team. A separate belief — that France's squad depth makes them the favorite — isn't something the historical data can support, partly because per-match historical squad values don't exist to train on, and attaching current values to old matches would be the same leakage trap as Elo.
 
----
+So squad value is applied transparently as a post-model adjustment rather than a trained feature: each matchup's odds are nudged in log-odds space by the squad-value gap, scaled by a single tunable weight. This is a deliberate, controllable way to combine a model with domain belief — a form of opinion pooling — and it is leakage-free precisely because it never touches training. The important honesty point: that weight is chosen by hand, so any output using it is a squad-value-*weighted* forecast, not a claim about what the data alone implies.
 
-## What each file does
+## Findings
 
-| File | Job |
-|------|-----|
-| `01_make_sample_data.py` | Creates fake stand-in data. **You delete/replace this once you have real data.** |
-| `02_features.py` | Builds one row per match with numeric features + the actual result. |
-| `03_train.py` | Trains logistic regression, checks it against a baseline, saves the model. |
-| `04_simulate.py` | Loads the model, simulates the bracket many times, prints winner odds. |
-| `data/` | Where all the CSVs and the saved model live. |
+The model comfortably beats the no-features baseline (log-loss around 0.87 versus roughly 1.05), with accuracy near 60%. Elo carries most of the predictive signal; recent form adds only a little. Left to the data alone, the simulation favors Argentina. With the squad-value prior applied at a moderate setting, France edges narrowly ahead of Spain and Argentina in a tight top three — a direct illustration of the difference between what a model concludes and what a modeler chooses to believe.
 
----
+![Round-by-round probabilities](bracket_probabilities.png)
 
-## Swapping in REAL data (do this Fri–Sat)
+## Data sources
 
-You only need to make your real files **look like the fake ones**. Open the fake
-CSVs in `data/` to see the exact columns, then produce real versions with the
-same column names. After that, steps 2–4 run unchanged.
+Match results come from the martj42 international football results dataset (~49,000 matches back to 1872). Squad market values are sourced from Transfermarkt. The Elo methodology follows the refinements documented at eloratings.net.
 
-**1. Historical matches** → replace `data/sample_matches.csv`
-Needs columns: `home_team, away_team, home_score, away_score, neutral`.
-Source: the Kaggle dataset *"International football results from 1872 to present"*
-(by Mart Jürisoo). It already has these columns — you mostly just rename a couple.
+## Scope and honesty
 
-**2. Team ratings** → replace `data/sample_elo.csv`
-Needs columns: `team, elo, fifa_rank`.
-Source: Elo from eloratings.net; FIFA ranking from FIFA's site. The single most
-important thing here is that **team names match exactly** between your matches
-file and your ratings file (e.g. decide once whether it's "USA" or "United
-States" and make everything agree). Mismatched names are the #1 bug in this kind
-of project.
-
-**3. The real 32-team bracket** → replace `data/sample_bracket.csv`
-Needs columns: `team, elo, fifa_rank, bracket_position`.
-The groups finish **Sat June 27** and the Round of 32 is set then. List the 32
-teams so that `bracket_position` 0 plays 1, 2 plays 3, etc., following the
-official bracket. This is your last step before running the final prediction
-Sunday morning.
-
-> Tip: build and fully test everything on the fake data first. Treat the real
-> numbers as a last-minute swap-in, not something you wait around for.
-
----
-
-## Ideas to make it better (only if you have time)
-
-- **Recent form**: in `02_features.py`, add each team's points-per-game over its
-  last ~5 matches as another feature. (Your earlier instinct — group-stage form —
-  goes here. Test whether it actually helps; over 3 games it can be noisy.)
-- **Squad strength** (your "club data" idea): add a `squad_value` column from
-  Transfermarkt market values and feed the difference as a feature. This is the
-  most time-consuming part to collect — leave it for last.
-- **Stronger model**: swap `LogisticRegression` for
-  `HistGradientBoostingClassifier` (also built into scikit-learn — change one
-  line in `03_train.py`). Often a bit more accurate.
-- **Confidence**: because the bracket is random, run step 4 a few times; if the
-  top teams' percentages jump around a lot, raise `N_SIMS`.
-
----
-
-## Common gotchas
-
-- *KeyError on a team name* → a name in your bracket/matches isn't in your
-  ratings file. Standardize names everywhere.
-- *Probabilities don't sum to 1* in step 4 → you have fewer/more than 32 teams,
-  or a duplicate; the bracket must be exactly 32 distinct teams.
-- *Model loses to the baseline* in step 3 → your features have a bug (often a
-  name-matching issue making `elo_diff` come out as 0/NaN). Fix before simulating.
+This is a learning project built around three features and a logistic regression, with a hand-set prior reflecting the author's own read of the tournament. It is best understood as an exercise in the *method* — framing, leakage avoidance, calibration, and the honest separation of model from belief — rather than as an authoritative forecast of who will win.
