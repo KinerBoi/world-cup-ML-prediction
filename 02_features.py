@@ -98,3 +98,16 @@ print("\nFirst few rows:")
 print(features.head())
 print("\nHow often each result happens (0=away win, 1=draw, 2=home win):")
 print(features["result"].value_counts(normalize=True).sort_index().round(3))
+
+# --- save each team's most recent form for step 4 ---
+home_side = matches[["date", "home_team", "home_form"]].rename(
+    columns={"home_team": "team", "home_form": "form"})
+away_side = matches[["date", "away_team", "away_form"]].rename(
+    columns={"away_team": "team", "away_form": "form"})
+long_form = pd.concat([home_side, away_side], ignore_index=True)
+
+(long_form.sort_values("date")
+          .groupby("team")["form"].last()
+          .reset_index()
+          .to_csv("data/current_form.csv", index=False))
+print("Wrote data/current_form.csv")

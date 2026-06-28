@@ -34,16 +34,22 @@ rng = np.random.default_rng(seed=7)
 
 # --- load everything from earlier steps ---
 model = joblib.load("data/model.joblib")
-elo = pd.read_csv("data/sample_elo.csv")
-bracket = pd.read_csv("data/sample_bracket.csv").sort_values("bracket_position")
+elo = pd.read_csv("data/elo.csv")
+bracket = pd.read_csv("data/bracket.csv").sort_values("bracket_position")
+current_form = pd.read_csv("data/current_form.csv")   # written by 02: one row per team, latest form
 
 elo_lookup = dict(zip(elo["team"], elo["elo"]))
-rank_lookup = dict(zip(elo["team"], elo["fifa_rank"]))
+form_lookup = dict(zip(current_form["team"], current_form["form"]))
 
 # Column order MUST match how the model was trained in step 3.
-FEATURE_COLS = ["elo_diff", "rank_diff", "neutral"]
+FEATURE_COLS = ["elo_diff", "form_diff", "neutral"]
 
 bracket_order = bracket["team"].tolist()
+
+# Fail loudly on name mismatches (e.g. "USA" vs "United States") instead of a
+# bare KeyError deep inside the simulation loop.
+missing = [t for t in bracket_order if t not in elo_lookup or t not in form_lookup]
+assert not missing, f"Bracket teams missing from elo/form lookups: {missing}"
 
 # ----------------------------------------------------------------------------
 # Precompute the probabilities for EVERY possible matchup, in one prediction
@@ -53,21 +59,43 @@ pairs = list(itertools.permutations(bracket_order, 2))
 
 feature_rows = [{
     "elo_diff": elo_lookup[a] - elo_lookup[b],
-    "rank_diff": rank_lookup[b] - rank_lookup[a],
+    "form_diff": form_lookup[a] - form_lookup[b],
     "neutral": 1,  # World Cup knockout games are at neutral venues
 } for (a, b) in pairs]
 
 feature_table = pd.DataFrame(feature_rows)[FEATURE_COLS]
 all_probs = model.predict_proba(feature_table)   # one fast batched call
 
-# model.classes_ is [0, 1, 2] = [b wins, draw, a wins]; find each column once
+# Your target encoding (from 02) is: 0 = away win, 1 = draw, 2 = home win.
+# team_a sits in the HOME slot (elo_diff = elo[a] - elo[b]), so:
+#   home win (label 2) -> team_a wins -> col_a
+#   draw      (label 1)               -> col_draw
+#   away win  (label 0) -> team_b wins -> col_b
 classes = list(model.classes_)
 col_b, col_draw, col_a = classes.index(0), classes.index(1), classes.index(2)
+
+# ----------------------------------------------------------------------------
+# Squad-value prior (your belief, applied ON TOP of the model — not a feature)
+# ----------------------------------------------------------------------------
+squad = pd.read_csv("data/squad_values.csv")
+sv = dict(zip(squad["Team"], squad["squad_value_GBP_million"]))
+
+# A name that doesn't match would silently get value 0 below and have its odds
+# crushed. Fail loudly instead so you know exactly which spelling to fix.
+sv_missing = [t for t in bracket_order if t not in sv]
+assert not sv_missing, f"No squad value for: {sv_missing}"
+
+BELIEF = 0.0005   # your knob: 0 = trust the model, higher = trust squad value more
 
 # Store results: win_prob[(a, b)] = (p_a_win, p_draw, p_b_win)
 win_prob = {}
 for (a, b), probs in zip(pairs, all_probs):
-    win_prob[(a, b)] = (probs[col_a], probs[col_draw], probs[col_b])
+    p_a, p_draw, p_b = probs[col_a], probs[col_draw], probs[col_b]
+    nudge = BELIEF * (sv[a] - sv[b])                     # + favors the richer squad
+    la, ld, lb = np.log([p_a, p_draw, p_b])
+    la, lb = la + nudge, lb - nudge                      # shift home/away logits
+    e = np.exp([la, ld, lb]); e /= e.sum()              # renormalize to sum 1
+    win_prob[(a, b)] = (e[0], e[1], e[2])
 
 
 def play_match(team_a, team_b):
