@@ -8,35 +8,43 @@ it's used for classification, and it naturally outputs PROBABILITIES (e.g.
 "61% home win, 24% draw, 15% away win"), which is exactly what the bracket
 simulator in step 4 needs.
 
-The most important habit in ML: never trust accuracy on the data you trained on.
-So we split the matches into a TRAIN set (the model studies these) and a TEST
-set (held back, the model never sees them during training). We judge the model
-only on the test set, the same way it'll face genuinely unseen 2026 matches.
+The most important habit in ML: never trust a score on the data you trained on.
+So instead of a random split, we split the matches BY DATE — train on 2015–2023
+and test on 2024 onward. That mirrors the real task: learn from the past, then
+predict matches that haven't happened yet. We judge the model only on the test
+years, the same way it'll face genuinely unseen 2026 games.
 
-We also compare against a dumb BASELINE ("the higher-Elo team always wins, no
-draws"). If your fancy model can't beat the baseline, the model isn't adding
-anything yet and you should fix the features before going further.
+We also compare against a dumb BASELINE that ignores the features entirely and
+just predicts the historical result rates (roughly 28% away, 23% draw, 49% home)
+for every match. The score we use is LOG-LOSS, which rewards confident-and-right
+predictions and punishes confident mistakes — lower is better. If our model
+can't beat that no-features baseline on log-loss, the features aren't adding
+anything yet, and we should fix them before moving on to step 4.
 """
 
 import joblib
 import numpy as np
 import pandas as pd
 from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, log_loss
 
 # --- load features from step 2 ---
-data = pd.read_csv("data/features.csv")
-feature_cols = ["elo_diff", "rank_diff", "neutral"]
+# --- load features from step 2 ---
+data = pd.read_csv("data/features.csv", parse_dates=["date"])
 
-X = data[feature_cols]   # the inputs
-y = data["result"]       # the answer we want to predict
+feature_cols = ["elo_diff", "form_diff", "neutral"]
 
-# --- split into train (80%) and test (20%) ---
-# random_state just fixes the split so results are repeatable while you learn.
-X_train, X_test, y_train, y_test = train_test_split(
-    X, y, test_size=0.2, random_state=42
-)
+train = data[(data["date"] >= "2015-01-01") & (data["date"] < "2024-01-01")]
+test  = data[data["date"] >= "2024-01-01"]
+
+X_train, y_train = train[feature_cols], train["result"]
+X_test,  y_test  = test[feature_cols],  test["result"]
+
+# always sanity-check the split actually has data in it
+print(f"train: {len(X_train):>5} matches  "
+      f"({train['date'].min().date()} → {train['date'].max().date()})")
+print(f"test : {len(X_test):>5} matches  "
+      f"({test['date'].min().date()} → {test['date'].max().date()})")
 
 # --- train the model ---
 # max_iter is just how long it's allowed to keep improving; 1000 is plenty here.
@@ -53,22 +61,24 @@ acc = accuracy_score(y_test, pred)
 # simulation uses the probabilities, not just the single top pick.
 ll = log_loss(y_test, proba)
 
-# --- baseline: higher Elo wins, otherwise call it for away ---
-# (elo_diff > 0 means home is stronger -> predict home win = class 2)
-baseline_pred = np.where(X_test["elo_diff"] > 0, 2, 0)
-baseline_acc = accuracy_score(y_test, baseline_pred)
+# --- baseline: ignore the features, just predict the historical class rates ---
+# how often each result happened in the TRAINING data (don't peek at test)
+class_rates = y_train.value_counts(normalize=True).sort_index()
 
-print("=== Model performance on unseen test matches ===")
-print(f"  Model accuracy   : {acc:.3f}")
-print(f"  Baseline accuracy: {baseline_acc:.3f}   (higher-Elo-wins rule)")
-print(f"  Model log-loss   : {ll:.3f}   (lower is better)")
+# give every test match those same three probabilities
+baseline_proba = np.tile(class_rates.values, (len(y_test), 1))
+baseline_ll = log_loss(y_test, baseline_proba, labels=class_rates.index)
+
+print("=== Performance on unseen test matches (lower log-loss = better) ===")
+print(f"  Model log-loss    : {ll:.3f}")
+print(f"  Baseline log-loss : {baseline_ll:.3f}   (ignores features, just class rates)")
+print(f"  Model accuracy    : {acc:.3f}")
 print()
-if acc >= baseline_acc - 0.01:
-    print("  Good: the model is matching or beating the baseline on accuracy,")
-    print("  AND (unlike the baseline) it outputs calibrated probabilities and")
-    print("  handles draws -- which is exactly what the step 4 simulation needs.")
+if ll < baseline_ll:
+    print("  Good: the model beats the no-features baseline, so elo_diff and")
+    print("  neutral are carrying real signal.")
 else:
-    print("  Warning: model is well below baseline. Improve features before step 4.")
+    print("  Warning: model isn't beating the baseline. Fix features before step 4.")
 
 # --- what did the model learn? peek at the coefficients ---
 # Bigger positive number => that feature pushes toward a home win.
